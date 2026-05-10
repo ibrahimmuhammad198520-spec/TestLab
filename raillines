@@ -1,0 +1,102 @@
+sdfsdf selects aBCD xyz option on rst opq
+Enter valid efghi number and proceed
+Enter invalid/non-existing efghi number
+Enter blocked/inactive efghi number
+jklm is generated and delivered to sdfsdf
+Enter valid jklm
+Enter invalid jklm
+Enter expired jklm
+Exceed maximum jklm retry attempts
+jklm API/aBCD system timeout during validation
+After valid jklm, opq opens tray for cash insertion
+sdfsdf inserts cash and opq calculates amount correctly
+sdfsdf cancels after cash amount is calculated
+sdfsdf confirms xyz amount
+xyz amount is within sdfsdf deposit limit
+xyz amount is equal to available deposit limit
+xyz amount exceeds deposit limit
+sdfsdf has zero/no available deposit limit
+aBCD returns failure reason after xyz request
+aBCD/opq middleware timeout after cash is inserted
+Duplicate/retry request sent for same xyz transaction
+Successful xyz transaction
+After success, opq middleware posts commission through Fund sdfsd/sdfi API
+Commission posting fails after successful xyz
+rst sends 0220/GL entry posting to cbd/dad
+GL/0220 posting fails
+rst sends final transaction status and ATN notification
+Final success message displayed on opq
+Failure after amount confirmation
+Remove opq xyz option from aBCD mobile app after go-live
+
+
+Scenario
+Network failure before cash insertion
+Power/network failure after cash insertion but before confirmation
+Power/network failure after confirmation but before aBCD response
+Cash jam / opq unable to return cash after failure
+opq calculates wrong amount or rejects notes
+Same efghi performs multiple xyz transactions same day
+
+
+Test Scenario
+Generate valid fad-clj code from aBCD app
+Perform fad-clj at rst opq with valid code and amount
+Enter invalid fad-clj code
+Enter expired fad-clj code
+Enter amount different from fad-clj request amount
+Successful fad-clj posting and commission
+--------------------------------------------------------------------------------------
+
+aBCD xyz journey should start successfully
+jklm request should be sent to aBCD system
+System should reject and show proper error
+Transaction should not proceed
+sdfsdf should receive jklm successfully
+jklm should be validated and opq cash tray should open
+System should show invalid jklm error; tray should not open
+System should reject jklm; tray should not open
+Journey should be blocked/terminated
+System should show failure/timeout message; tray should not open
+sdfsdf should be allowed to insert cash
+Calculated amount should be displayed for confirmation
+opq tray should open and return inserted cash
+rst should send xyz request to aBCD with amount details
+aBCD should accept; transaction should proceed successfully
+Transaction should be accepted
+Transaction should fail and opq should return cash
+Transaction should fail and opq should return cash
+opq should display failure reason and return cash
+Transaction should not be credited blindly; cash return/reversal process should trigger
+sdfsdf efghi should not be credited twice
+sdfsdf efghi should be credited with correct amount
+Commission posting should be triggered successfully
+xyz should remain successful, but commission failure should be logged/handled as per process
+GL entry should be posted successfully
+Transaction status should be handled properly and failure should be logged
+aBCD should receive/update final transaction status
+sdfsdf should see successful xyz message
+opq should display failure and return cash to sdfsdf
+xyz option should not be available in aBCD app
+
+
+Expected Result
+Transaction should stop; no debit/credit/posting should happen
+System should handle recovery; sdfsdf cash should not be lost
+Transaction should be reconciled using transaction status/ATN
+Error should be logged and opq should follow dispute/reconciliation process
+sdfsdf should be shown correct accepted/rejected amount before confirmation
+Deposit limit should be calculated correctly after each transaction
+
+
+Expected Result
+fad-clj code should be generated successfully
+Cash should be dispensed successfully
+opq should reject transaction
+opq should reject transaction
+opq should reject or show limit/error message
+qqS/Eqqqon posting and commission should work as existing
+
+
+
+
