@@ -1,0 +1,495 @@
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+
+public override void Run()
+{
+    // Cap how many individual differences get written to the Leapwork
+    // execution log (the full detail always goes into ReportText / the
+    // report file regardless of this cap).
+    const int MaxLoggedDifferences = 200;
+
+    // ---- 1. Read and validate input fields ----
+    string prodFilePath = Convert.ToString(Fields["ProdFilePath"])?.Trim() ?? "";
+    string testFilePath = Convert.ToString(Fields["TestFilePath"])?.Trim() ?? "";
+    string layoutConfigPath = Convert.ToString(Fields["LayoutConfigPath"])?.Trim() ?? "";
+    string outputReportPath = Convert.ToString(Fields["OutputReportPath"])?.Trim() ?? "";
+
+    if (string.IsNullOrEmpty(prodFilePath))
+        throw new ArgumentException("ProdFilePath is required.");
+    if (string.IsNullOrEmpty(testFilePath))
+        throw new ArgumentException("TestFilePath is required.");
+    if (!File.Exists(prodFilePath))
+        throw new ArgumentException($"Production file not found: '{prodFilePath}'.");
+    if (!File.Exists(testFilePath))
+        throw new ArgumentException($"Test file not found: '{testFilePath}'.");
+    if (!string.IsNullOrEmpty(layoutConfigPath) && !File.Exists(layoutConfigPath))
+        throw new ArgumentException($"Layout config file not found: '{layoutConfigPath}'.");
+
+    LogMessage($"Production file : {prodFilePath}");
+    LogMessage($"Test file       : {testFilePath}");
+    LogMessage(string.IsNullOrEmpty(layoutConfigPath)
+        ? "Layout config   : (none supplied - using built-in SAMPLE layout)"
+        : $"Layout config   : {layoutConfigPath}");
+
+    // ---- 2. Build layout rules, longest type-code first (used for prefix identification) ----
+    List<Dictionary<string, string>> layoutRules = string.IsNullOrEmpty(layoutConfigPath)
+        ? BuildDefaultLayout()
+        : LoadLayoutFromCsv(layoutConfigPath);
+    layoutRules = layoutRules.OrderByDescending(r => r["Code"].Length).ToList();
+
+    // ---- 3. Parse both files ----
+    List<Dictionary<string, string>> prodRecords = ParseFile(prodFilePath, layoutRules);
+    List<Dictionary<string, string>> testRecords = ParseFile(testFilePath, layoutRules);
+    LogMessage($"Parsed {prodRecords.Count} production record(s), {testRecords.Count} test record(s).");
+
+    // ---- 4. Compare, type by type ----
+    var summaryLines = new List<string>();
+    var missingLines = new List<string>();
+    var extraLines = new List<string>();
+    var diffLines = new List<string>();
+    var warningLines = new List<string>();
+
+    int totalMatched = 0, totalMissing = 0, totalExtra = 0, totalWithDiffs = 0, totalDiffSpans = 0;
+
+    var prodByType = prodRecords.GroupBy(r => r["TypeCode"]).ToDictionary(g => g.Key, g => g.ToList());
+    var testByType = testRecords.GroupBy(r => r["TypeCode"]).ToDictionary(g => g.Key, g => g.ToList());
+    var allTypes = new List<string>(prodByType.Keys);
+    foreach (string t in testByType.Keys) if (!allTypes.Contains(t)) allTypes.Add(t);
+
+    foreach (string typeCode in allTypes)
+    {
+        List<Dictionary<string, string>> prodList = prodByType.ContainsKey(typeCode) ? prodByType[typeCode] : new List<Dictionary<string, string>>();
+        List<Dictionary<string, string>> testList = testByType.ContainsKey(typeCode) ? testByType[typeCode] : new List<Dictionary<string, string>>();
+        string typeName = prodList.Count > 0 ? prodList[0]["TypeName"] : (testList.Count > 0 ? testList[0]["TypeName"] : typeCode);
+        Dictionary<string, string> rule = GetRuleOrDefault(typeCode, layoutRules);
+
+        int typeMatched = 0, typeMissing = 0, typeExtra = 0, typeWithDiffs = 0, typeDiffSpans = 0;
+
+        CompareType(typeCode, typeName, prodList, testList, rule,
+                    missingLines, extraLines, diffLines, warningLines,
+                    ref typeMatched, ref typeMissing, ref typeExtra, ref typeWithDiffs, ref typeDiffSpans);
+
+        summaryLines.Add(string.Format("{0,-6} {1,-24} {2,8} {3,8} {4,8} {5,8} {6,8} {7,10}",
+            typeCode, Truncate(typeName, 24), prodList.Count, testList.Count, typeMatched, typeMissing, typeExtra, typeWithDiffs));
+
+        totalMatched += typeMatched;
+        totalMissing += typeMissing;
+        totalExtra += typeExtra;
+        totalWithDiffs += typeWithDiffs;
+        totalDiffSpans += typeDiffSpans;
+    }
+
+    bool overallPass = totalMissing == 0 && totalExtra == 0 && totalWithDiffs == 0;
+
+    // ---- 5. Build the report text ----
+    string reportText = BuildReportText(prodFilePath, testFilePath, prodRecords.Count, testRecords.Count,
+        summaryLines, missingLines, extraLines, diffLines, warningLines, overallPass, totalDiffSpans);
+
+    string reportSummary =
+        $"Overall Result: {(overallPass ? "PASS" : "FAIL")}\n" +
+        $"Matched: {totalMatched} | Missing: {totalMissing} | Extra: {totalExtra} | " +
+        $"Records With Differences: {totalWithDiffs} | Total Difference Spans: {totalDiffSpans} | " +
+        $"Duplicate Key Warnings: {warningLines.Count}";
+
+    // ---- 6. Write outputs ----
+    Fields["OverallResult"] = overallPass ? "PASS" : "FAIL";
+    Fields["ProdRecordCount"] = prodRecords.Count.ToString();
+    Fields["TestRecordCount"] = testRecords.Count.ToString();
+    Fields["MatchedCount"] = totalMatched.ToString();
+    Fields["MissingCount"] = totalMissing.ToString();
+    Fields["ExtraCount"] = totalExtra.ToString();
+    Fields["RecordsWithDifferencesCount"] = totalWithDiffs.ToString();
+    Fields["DifferenceCount"] = totalDiffSpans.ToString();
+    Fields["DuplicateKeyWarningCount"] = warningLines.Count.ToString();
+    Fields["ReportSummary"] = reportSummary;
+    Fields["ReportText"] = reportText;
+
+    if (!string.IsNullOrEmpty(outputReportPath))
+    {
+        File.WriteAllText(outputReportPath, reportText);
+        Fields["ReportFilePath"] = outputReportPath;
+        LogMessage($"Report written to: {outputReportPath}");
+    }
+    else
+    {
+        Fields["ReportFilePath"] = "";
+    }
+
+    // ---- 7. Log a readable summary (and a capped number of individual differences) ----
+    LogMessage(reportSummary);
+    int loggedDiffs = 0;
+    foreach (string line in diffLines)
+    {
+        if (loggedDiffs >= MaxLoggedDifferences)
+        {
+            LogMessage($"... {diffLines.Count - loggedDiffs} more difference line(s) omitted from the log — see ReportText / ReportFilePath.");
+            break;
+        }
+        LogMessage(line);
+        loggedDiffs++;
+    }
+}
+
+// ============================================================================
+// Layout construction
+// ============================================================================
+
+private List<Dictionary<string, string>> BuildDefaultLayout()
+{
+    // SAMPLE / PLACEHOLDER layout. Replace with the confirmed real spec —
+    // either edit here or (preferably) supply LayoutConfigPath instead.
+    var rules = new List<Dictionary<string, string>>();
+    rules.Add(NewRule("FH", "File Header", 0, 0, ""));
+    rules.Add(NewRule("BH", "Batch Header", 0, 0, "3:4")); // batch sequence number - ignored per requirement
+    rules.Add(NewRule("TXV", "Transaction Detail", 122, 12, "")); // RRN as unique key
+    rules.Add(NewRule("BT", "Batch Trailer", 0, 0, ""));
+    rules.Add(NewRule("FT", "File Trailer", 0, 0, ""));
+    return rules;
+}
+
+private Dictionary<string, string> NewRule(string code, string name, int keyStart, int keyLength, string ignoreZones)
+{
+    var rule = new Dictionary<string, string>();
+    rule["Code"] = code;
+    rule["Name"] = name;
+    rule["KeyStart"] = keyStart.ToString();
+    rule["KeyLength"] = keyLength.ToString();
+    rule["IgnoreZones"] = ignoreZones ?? "";
+    return rule;
+}
+
+private List<Dictionary<string, string>> LoadLayoutFromCsv(string csvPath)
+{
+    var rules = new List<Dictionary<string, string>>();
+    bool headerSkipped = false;
+
+    foreach (string rawLine in File.ReadLines(csvPath))
+    {
+        if (string.IsNullOrWhiteSpace(rawLine) || rawLine.TrimStart().StartsWith("#")) continue;
+        if (!headerSkipped) { headerSkipped = true; continue; }
+
+        string[] c = rawLine.Split(',');
+        if (c.Length < 5) continue;
+
+        string code = c[0].Trim();
+        string name = c[1].Trim();
+        int keyStart = int.Parse(c[2].Trim());
+        int keyLength = int.Parse(c[3].Trim());
+        string ignoreZones = c[4].Trim();
+
+        rules.Add(NewRule(code, name, keyStart, keyLength, ignoreZones));
+    }
+    return rules;
+}
+
+/// <summary>Looks up the rule for a type code; falls back to a "no key, no ignore zones" rule for unmapped types.</summary>
+private Dictionary<string, string> GetRuleOrDefault(string typeCode, List<Dictionary<string, string>> rules)
+{
+    foreach (var r in rules) if (r["Code"] == typeCode) return r;
+    return NewRule(typeCode, "UNKNOWN / Unmapped record type", 0, 0, "");
+}
+
+/// <summary>Identifies which rule a raw line belongs to via longest-prefix match; falls back to UNKNOWN.</summary>
+private Dictionary<string, string> IdentifyType(string line, List<Dictionary<string, string>> rulesLongestFirst)
+{
+    foreach (var r in rulesLongestFirst)
+        if (line.StartsWith(r["Code"])) return r;
+    return NewRule("UNKNOWN", "UNKNOWN / Unmapped record type", 0, 0, "");
+}
+
+// ============================================================================
+// Parsing
+// ============================================================================
+
+/// <summary>Streams a file line-by-line into records: LineNumber, RawLine, TypeCode, TypeName, MatchKey.</summary>
+private List<Dictionary<string, string>> ParseFile(string filePath, List<Dictionary<string, string>> rulesLongestFirst)
+{
+    var records = new List<Dictionary<string, string>>();
+    int lineNo = 0;
+
+    using (var reader = new StreamReader(filePath))
+    {
+        string line;
+        while ((line = reader.ReadLine()) != null)
+        {
+            lineNo++;
+            if (string.IsNullOrWhiteSpace(line)) continue;
+
+            var rule = IdentifyType(line, rulesLongestFirst);
+            int keyStart = int.Parse(rule["KeyStart"]);
+            int keyLength = int.Parse(rule["KeyLength"]);
+            string matchKey = keyLength > 0 ? ExtractSubstring(line, keyStart, keyLength).Trim() : "";
+
+            var rec = new Dictionary<string, string>();
+            rec["LineNumber"] = lineNo.ToString();
+            rec["RawLine"] = line;
+            rec["TypeCode"] = rule["Code"];
+            rec["TypeName"] = rule["Name"];
+            rec["MatchKey"] = matchKey;
+            records.Add(rec);
+        }
+    }
+    return records;
+}
+
+/// <summary>1-based, bounds-safe substring extraction.</summary>
+private string ExtractSubstring(string line, int start1Based, int length)
+{
+    int from = start1Based - 1;
+    if (from < 0 || from >= line.Length) return "";
+    int to = Math.Min(from + length, line.Length);
+    return line.Substring(from, to - from);
+}
+
+/// <summary>Parses an "start:length|start:length" ignore-zone string into a list of (start,length) tuples.</summary>
+private List<(int Start, int Length)> ParseZones(string raw)
+{
+    var zones = new List<(int, int)>();
+    if (string.IsNullOrEmpty(raw)) return zones;
+    foreach (string part in raw.Split('|'))
+    {
+        string[] p = part.Split(':');
+        if (p.Length == 2) zones.Add((int.Parse(p[0].Trim()), int.Parse(p[1].Trim())));
+    }
+    return zones;
+}
+
+private bool IsIgnored(int index0Based, List<(int Start, int Length)> zones)
+{
+    foreach (var z in zones)
+    {
+        int from = z.Start - 1;
+        int to = from + z.Length;
+        if (index0Based >= from && index0Based < to) return true;
+    }
+    return false;
+}
+
+// ============================================================================
+// Comparison
+// ============================================================================
+
+/// <summary>
+/// Matches records of one type between production and test, and appends
+/// human-readable lines to missingLines / extraLines / diffLines /
+/// warningLines. Counters are accumulated via ref parameters.
+/// </summary>
+private void CompareType(
+    string typeCode, string typeName,
+    List<Dictionary<string, string>> prodList, List<Dictionary<string, string>> testList,
+    Dictionary<string, string> rule,
+    List<string> missingLines, List<string> extraLines, List<string> diffLines, List<string> warningLines,
+    ref int matched, ref int missing, ref int extra, ref int withDiffs, ref int diffSpanTotal)
+{
+    bool hasKey = int.Parse(rule["KeyLength"]) > 0;
+    var ignoreZones = ParseZones(rule["IgnoreZones"]);
+
+    if (hasKey)
+    {
+        var prodByKey = prodList.GroupBy(r => r["MatchKey"]).ToDictionary(g => g.Key, g => g.ToList());
+        var testByKey = testList.GroupBy(r => r["MatchKey"]).ToDictionary(g => g.Key, g => g.ToList());
+
+        foreach (var kv in prodByKey)
+            if (kv.Value.Count > 1)
+                warningLines.Add($"[PRODUCTION] record type '{typeCode}' key '{kv.Key}' appears {kv.Value.Count} times (lines: {string.Join(",", kv.Value.Select(r => r["LineNumber"]))})");
+        foreach (var kv in testByKey)
+            if (kv.Value.Count > 1)
+                warningLines.Add($"[TEST] record type '{typeCode}' key '{kv.Key}' appears {kv.Value.Count} times (lines: {string.Join(",", kv.Value.Select(r => r["LineNumber"]))})");
+
+        var allKeys = new List<string>(prodByKey.Keys);
+        foreach (string k in testByKey.Keys) if (!allKeys.Contains(k)) allKeys.Add(k);
+
+        foreach (string key in allKeys)
+        {
+            List<Dictionary<string, string>> pMatches = prodByKey.ContainsKey(key) ? prodByKey[key] : new List<Dictionary<string, string>>();
+            List<Dictionary<string, string>> tMatches = testByKey.ContainsKey(key) ? testByKey[key] : new List<Dictionary<string, string>>();
+
+            if (pMatches.Count == 0)
+            {
+                foreach (var t in tMatches)
+                {
+                    extraLines.Add($"Type: {typeCode} ({typeName}) | Key: {key} | Line#: {t["LineNumber"]} | Raw: {t["RawLine"]}");
+                    extra++;
+                }
+                continue;
+            }
+            if (tMatches.Count == 0)
+            {
+                foreach (var p in pMatches)
+                {
+                    missingLines.Add($"Type: {typeCode} ({typeName}) | Key: {key} | Line#: {p["LineNumber"]} | Raw: {p["RawLine"]}");
+                    missing++;
+                }
+                continue;
+            }
+
+            int pairCount = Math.Min(pMatches.Count, tMatches.Count);
+            for (int i = 0; i < pairCount; i++)
+            {
+                bool hadDiff = AppendDifference(typeCode, typeName, key, pMatches[i], tMatches[i], ignoreZones, diffLines, ref diffSpanTotal);
+                matched++;
+                if (hadDiff) withDiffs++;
+            }
+            for (int i = pairCount; i < pMatches.Count; i++)
+            {
+                missingLines.Add($"Type: {typeCode} ({typeName}) | Key: {key} | Line#: {pMatches[i]["LineNumber"]} | Raw: {pMatches[i]["RawLine"]}");
+                missing++;
+            }
+            for (int i = pairCount; i < tMatches.Count; i++)
+            {
+                extraLines.Add($"Type: {typeCode} ({typeName}) | Key: {key} | Line#: {tMatches[i]["LineNumber"]} | Raw: {tMatches[i]["RawLine"]}");
+                extra++;
+            }
+        }
+    }
+    else
+    {
+        // No natural key (singleton header/trailer, typically) - match by occurrence order.
+        int pairCount = Math.Min(prodList.Count, testList.Count);
+        for (int i = 0; i < pairCount; i++)
+        {
+            bool hadDiff = AppendDifference(typeCode, typeName, "(no key - occurrence #" + (i + 1) + ")",
+                prodList[i], testList[i], ignoreZones, diffLines, ref diffSpanTotal);
+            matched++;
+            if (hadDiff) withDiffs++;
+        }
+        for (int i = pairCount; i < prodList.Count; i++)
+        {
+            missingLines.Add($"Type: {typeCode} ({typeName}) | Key: (no key - occurrence #{i + 1}) | Line#: {prodList[i]["LineNumber"]} | Raw: {prodList[i]["RawLine"]}");
+            missing++;
+        }
+        for (int i = pairCount; i < testList.Count; i++)
+        {
+            extraLines.Add($"Type: {typeCode} ({typeName}) | Key: (no key - occurrence #{i + 1}) | Line#: {testList[i]["LineNumber"]} | Raw: {testList[i]["RawLine"]}");
+            extra++;
+        }
+    }
+}
+
+/// <summary>
+/// Compares one matched pair character-by-character (skipping ignore zones),
+/// appends a formatted block to diffLines if anything differs, and returns
+/// whether a difference was found.
+/// </summary>
+private bool AppendDifference(
+    string typeCode, string typeName, string key,
+    Dictionary<string, string> prod, Dictionary<string, string> test,
+    List<(int Start, int Length)> ignoreZones, List<string> diffLines, ref int diffSpanTotal)
+{
+    string prodLine = prod["RawLine"];
+    string testLine = test["RawLine"];
+    string prodLineNo = prod["LineNumber"];
+    string testLineNo = test["LineNumber"];
+
+    bool lengthMismatch = prodLine.Length != testLine.Length;
+    var spans = PositionalDiff(prodLine, testLine, ignoreZones);
+
+    if (spans.Count == 0 && !lengthMismatch) return false;
+
+    diffSpanTotal += spans.Count;
+
+    var block = new StringBuilder();
+    block.Append($"Record Type: {typeCode} ({typeName}) | Key: {key} | Prod Line# {prodLineNo} <-> Test Line# {testLineNo}\n");
+    if (lengthMismatch)
+        block.Append($"    [LINE LENGTH MISMATCH] Prod length={prodLine.Length}, Test length={testLine.Length}\n");
+    foreach (var s in spans)
+        block.Append(string.Format("    [CONTENT DIFF] Position:{0,-5} Length:{1,-3} | Prod:'{2}' | Test:'{3}'\n",
+            s.Start, s.Length, s.ProdValue, s.TestValue));
+
+    diffLines.Add(block.ToString().TrimEnd('\n'));
+    return true;
+}
+
+/// <summary>
+/// Walks two same/near-length lines character by character (skipping ignore
+/// zones) and groups contiguous differing runs into spans: (Start 1-based,
+/// Length, ProdValue, TestValue). Only the overlapping region is compared;
+/// an overall length mismatch is reported separately by the caller.
+/// </summary>
+private List<(int Start, int Length, string ProdValue, string TestValue)> PositionalDiff(
+    string prodLine, string testLine, List<(int Start, int Length)> ignoreZones)
+{
+    var result = new List<(int, int, string, string)>();
+    int minLen = Math.Min(prodLine.Length, testLine.Length);
+    int spanStart = -1;
+
+    for (int i = 0; i <= minLen; i++)
+    {
+        bool atEnd = (i == minLen);
+        bool ignored = !atEnd && IsIgnored(i, ignoreZones);
+        bool differsHere = !atEnd && !ignored && prodLine[i] != testLine[i];
+
+        if (differsHere)
+        {
+            if (spanStart == -1) spanStart = i;
+        }
+        else if (spanStart != -1)
+        {
+            result.Add((spanStart + 1, i - spanStart, prodLine.Substring(spanStart, i - spanStart), testLine.Substring(spanStart, i - spanStart)));
+            spanStart = -1;
+        }
+    }
+    return result;
+}
+
+// ============================================================================
+// Report assembly
+// ============================================================================
+
+private string Truncate(string s, int len)
+{
+    return s.Length <= len ? s : s.Substring(0, len - 1) + "...";
+}
+
+private string BuildReportText(
+    string prodFilePath, string testFilePath, int prodLineCount, int testLineCount,
+    List<string> summaryLines, List<string> missingLines, List<string> extraLines,
+    List<string> diffLines, List<string> warningLines, bool overallPass, int totalDiffSpans)
+{
+    string bar = new string('=', 100);
+    string subBar = new string('-', 100);
+    var sb = new StringBuilder();
+
+    sb.Append(bar).Append("\n");
+    sb.Append("T FILE COMPARISON REPORT\n");
+    sb.Append(bar).Append("\n");
+    sb.Append($"Generated at    : {DateTime.Now:yyyy-MM-dd HH:mm:ss}\n");
+    sb.Append($"Production file : {prodFilePath}\n");
+    sb.Append($"Test file       : {testFilePath}\n");
+    sb.Append($"Prod line count : {prodLineCount}\n");
+    sb.Append($"Test line count : {testLineCount}\n\n");
+
+    sb.Append("SECTION 1: SUMMARY BY RECORD TYPE\n").Append(subBar).Append("\n");
+    sb.Append(string.Format("{0,-6} {1,-24} {2,8} {3,8} {4,8} {5,8} {6,8} {7,10}\n",
+        "Type", "Name", "ProdCnt", "TestCnt", "Matched", "Missing", "Extra", "WithDiffs"));
+    foreach (string line in summaryLines) sb.Append(line).Append("\n");
+    sb.Append("(Note: 'Matched' pairs records by key - e.g. RRN - not by row number;\n");
+    sb.Append(" a record found on a different row than its counterpart is NOT treated as a mismatch.)\n\n");
+
+    sb.Append("SECTION 2: MISSING RECORDS (present in PRODUCTION, absent in TEST)\n").Append(subBar).Append("\n");
+    sb.Append(missingLines.Count == 0 ? "(none)\n" : string.Join("\n", missingLines) + "\n");
+    sb.Append("\n");
+
+    sb.Append("SECTION 3: EXTRA RECORDS (present in TEST, absent in PRODUCTION)\n").Append(subBar).Append("\n");
+    sb.Append(extraLines.Count == 0 ? "(none)\n" : string.Join("\n", extraLines) + "\n");
+    sb.Append("\n");
+
+    sb.Append("SECTION 4: CONTENT DIFFERENCES (matched records with position/length/content differences)\n").Append(subBar).Append("\n");
+    sb.Append(diffLines.Count == 0 ? "(none)\n" : string.Join("\n\n", diffLines) + "\n");
+    sb.Append("\n");
+
+    sb.Append("SECTION 5: DUPLICATE KEY WARNINGS\n").Append(subBar).Append("\n");
+    sb.Append(warningLines.Count == 0 ? "(none)\n" : string.Join("\n", warningLines) + "\n");
+    sb.Append("\n");
+
+    sb.Append(bar).Append("\n");
+    sb.Append($"OVERALL RESULT: {(overallPass ? "PASS - files are equivalent" : "FAIL - differences found")}\n");
+    sb.Append($"Total content-difference spans: {totalDiffSpans}\n");
+    sb.Append(bar).Append("\n");
+
+    return sb.ToString();
+}
