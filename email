@@ -1,0 +1,356 @@
+Project Setup
+
+bash
+# Create the class library
+dotnet new classlib -n EmailService.Core -f net8.0
+cd EmailService.Core
+
+# Add MailKit (brings in MimeKit as a dependency automatically)
+dotnet add package MailKit
+
+Delete the default Class1.cs — we'll replace it with the files below.
+
+EmailService.Core/
+ ├─ EmailService.Core.csproj
+ ├─ SmtpConfig.cs
+ ├─ IEmailService.cs
+ ├─ EmailTemplateEngine.cs
+ └─ EmailService.cs
+
+
+namespace EmailService.Core;
+
+/// <summary>
+/// Holds SMTP connection details. Pass this in via constructor injection
+/// or bind it from appsettings.json using IOptions<SmtpConfig>.
+/// </summary>
+public class SmtpConfig
+{
+    public string Host { get; set; } = string.Empty;
+    public int Port { get; set; } = 587;
+    public string Username { get; set; } = string.Empty;
+    public string Password { get; set; } = string.Empty;
+    public bool EnableSsl { get; set; } = true;
+    public string FromAddress { get; set; } = string.Empty;
+    public string FromName { get; set; } = string.Empty;
+
+    /// <summary>Optional: timeout in milliseconds for the SMTP client.</summary>
+    public int TimeoutMs { get; set; } = 20000;
+}
+
+namespace EmailService.Core;
+
+public interface IEmailService
+{
+    Task SendEmailAsync(
+        string to,
+        string subject,
+        string body,
+        bool isHtml = true,
+        CancellationToken cancellationToken = default);
+
+    Task SendEmailAsync(
+        IEnumerable<string> to,
+        string subject,
+        string body,
+        bool isHtml = true,
+        IEnumerable<string>? cc = null,
+        IEnumerable<string>? bcc = null,
+        IEnumerable<string>? attachmentPaths = null,
+        CancellationToken cancellationToken = default);
+
+    Task SendTemplatedEmailAsync(
+        string to,
+        string subject,
+        string template,
+        IDictionary<string, string> tokens,
+        bool isHtml = true,
+        CancellationToken cancellationToken = default);
+}
+
+
+
+using System.Text;
+using System.Text.RegularExpressions;
+
+namespace EmailService.Core;
+
+/// <summary>
+/// Handles simple token replacement in templates, e.g. "Hello {{Name}}"
+/// plus a couple of convenience helpers for wrapping plain text in HTML.
+/// </summary>
+public static class EmailTemplateEngine
+{
+    private static readonly Regex TokenPattern = new(@"\{\{\s*(\w+)\s*\}\}", RegexOptions.Compiled);
+
+    /// <summary>
+    /// Replaces {{Token}} placeholders in a template string with values from the dictionary.
+    /// Unmatched tokens are left as-is (or optionally removed).
+    /// </summary>
+    public static string Render(string template, IDictionary<string, string> tokens, bool removeUnmatched = false)
+    {
+        if (string.IsNullOrEmpty(template)) return string.Empty;
+
+        return TokenPattern.Replace(template, match =>
+        {
+            var key = match.Groups[1].Value;
+            if (tokens.TryGetValue(key, out var value))
+                return value;
+
+            return removeUnmatched ? string.Empty : match.Value;
+        });
+    }
+
+    /// <summary>
+    /// Wraps plain text content in a minimal, email-client-safe HTML shell.
+    /// Useful when you have plain text but want to send isHtml = true for consistent rendering.
+    /// </summary>
+    public static string WrapPlainTextAsHtml(string plainText, string? title = null)
+    {
+        var escaped = System.Net.WebUtility.HtmlEncode(plainText).Replace("\n", "<br/>");
+        var sb = new StringBuilder();
+        sb.Append("<html><body style=\"font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#222;\">");
+        if (!string.IsNullOrEmpty(title))
+            sb.Append($"<h2>{System.Net.WebUtility.HtmlEncode(title)}</h2>");
+        sb.Append($"<p>{escaped}</p>");
+        sb.Append("</body></html>");
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Strips basic HTML tags to produce a plain-text fallback (for MimeKit's TextBody alt-view).
+    /// </summary>
+    public static string StripHtml(string html)
+    {
+        if (string.IsNullOrEmpty(html)) return string.Empty;
+        var noTags = Regex.Replace(html, "<.*?>", string.Empty);
+        return System.Net.WebUtility.HtmlDecode(noTags).Trim();
+    }
+}
+
+
+using MailKit.Net.Smtp;
+using MailKit.Security;
+using MimeKit;
+
+namespace EmailService.Core;
+
+public class EmailService : IEmailService, IDisposable
+{
+    private readonly SmtpConfig _config;
+
+    public EmailService(SmtpConfig config)
+    {
+        _config = config ?? throw new ArgumentNullException(nameof(config));
+
+        if (string.IsNullOrWhiteSpace(_config.Host))
+            throw new ArgumentException("SMTP Host must be provided.", nameof(config));
+    }
+
+    public Task SendEmailAsync(
+        string to,
+        string subject,
+        string body,
+        bool isHtml = true,
+        CancellationToken cancellationToken = default)
+    {
+        return SendEmailAsync(new[] { to }, subject, body, isHtml, cancellationToken: cancellationToken);
+    }
+
+    public async Task SendEmailAsync(
+        IEnumerable<string> to,
+        string subject,
+        string body,
+        bool isHtml = true,
+        IEnumerable<string>? cc = null,
+        IEnumerable<string>? bcc = null,
+        IEnumerable<string>? attachmentPaths = null,
+        CancellationToken cancellationToken = default)
+    {
+        var message = new MimeMessage();
+        message.From.Add(new MailboxAddress(_config.FromName, _config.FromAddress));
+
+        foreach (var addr in to)
+            message.To.Add(MailboxAddress.Parse(addr));
+
+        if (cc != null)
+            foreach (var addr in cc)
+                message.Cc.Add(MailboxAddress.Parse(addr));
+
+        if (bcc != null)
+            foreach (var addr in bcc)
+                message.Bcc.Add(MailboxAddress.Parse(addr));
+
+        message.Subject = subject;
+
+        var builder = new BodyBuilder();
+        if (isHtml)
+        {
+            builder.HtmlBody = body;
+            builder.TextBody = EmailTemplateEngine.StripHtml(body); // plain-text fallback
+        }
+        else
+        {
+            builder.TextBody = body;
+        }
+
+        if (attachmentPaths != null)
+        {
+            foreach (var path in attachmentPaths)
+            {
+                if (File.Exists(path))
+                    builder.Attachments.Add(path);
+            }
+        }
+
+        message.Body = builder.ToMessageBody();
+
+        await SendAsync(message, cancellationToken);
+    }
+
+    public async Task SendTemplatedEmailAsync(
+        string to,
+        string subject,
+        string template,
+        IDictionary<string, string> tokens,
+        bool isHtml = true,
+        CancellationToken cancellationToken = default)
+    {
+        var renderedBody = EmailTemplateEngine.Render(template, tokens);
+        await SendEmailAsync(to, subject, renderedBody, isHtml, cancellationToken);
+    }
+
+    private async Task SendAsync(MimeMessage message, CancellationToken cancellationToken)
+    {
+        using var client = new SmtpClient
+        {
+            Timeout = _config.TimeoutMs
+        };
+
+        var socketOptions = _config.EnableSsl
+            ? SecureSocketOptions.StartTlsWhenAvailable
+            : SecureSocketOptions.None;
+
+        try
+        {
+            await client.ConnectAsync(_config.Host, _config.Port, socketOptions, cancellationToken);
+
+            if (!string.IsNullOrEmpty(_config.Username))
+                await client.AuthenticateAsync(_config.Username, _config.Password, cancellationToken);
+
+            await client.SendAsync(message, cancellationToken);
+        }
+        finally
+        {
+            if (client.IsConnected)
+                await client.DisconnectAsync(true, cancellationToken);
+        }
+    }
+
+    public void Dispose()
+    {
+        // Nothing persistent to dispose since SmtpClient is created per-send;
+        // included for future extensibility (e.g. pooled connections).
+        GC.SuppressFinalize(this);
+    }
+}
+
+
+Example of usage
+
+var config = new SmtpConfig
+{
+    Host = "smtp.office365.com",
+    Port = 587,
+    Username = "alerts@yourdomain.com",
+    Password = "app-password-or-secret",
+    EnableSsl = true,
+    FromAddress = "alerts@yourdomain.com",
+    FromName = "Test Automation Bot"
+};
+
+var emailService = new EmailService.Core.EmailService(config);
+
+var tokens = new Dictionary<string, string>
+{
+    ["Name"] = "Ali",
+    ["RunId"] = "12345",
+    ["Status"] = "PASSED"
+};
+
+var template = "<h2>Hi {{Name}},</h2><p>Run {{RunId}} finished with status: <b>{{Status}}</b></p>";
+
+await emailService.SendTemplatedEmailAsync(
+    to: "ali@example.com",
+    subject: "Test Execution Report",
+    template: template,
+    tokens: tokens,
+    isHtml: true);
+
+
+
+PACKED IT
+
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+
+    <!-- NuGet packaging metadata -->
+    <PackageId>YourCompany.EmailService.Core</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>Ali</Authors>
+    <Description>Reusable MailKit-based SMTP email service with templating support.</Description>
+    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="MailKit" Version="4.*" />
+  </ItemGroup>
+
+</Project>
+
+Build It
+
+dotnet pack -c Release
+
+If you don't want to run a feed, you can even use a local folder as a NuGet source:
+dotnet nuget push bin/Release/EmailService.Core.1.0.0.nupkg --source C:\LocalNuGetFeed
+
+
+B. A true single-file DLL
+
+
+If you genuinely want one .dll file with MailKit/MimeKit's IL merged inside it (e.g. to literally drag-drop into a project with zero NuGet setup), use ILRepack:
+
+
+dotnet add package ILRepack.Lib.MSBuild.Task --version 2.*
+
+.csproj
+
+<Target Name="ILRepacker" AfterTargets="Build" Condition="'$(Configuration)' == 'Release'">
+  <ItemGroup>
+    <InputAssemblies Include="$(OutputPath)$(AssemblyName).dll" />
+    <InputAssemblies Include="$(OutputPath)MailKit.dll" />
+    <InputAssemblies Include="$(OutputPath)MimeKit.dll" />
+    <InputAssemblies Include="$(OutputPath)BouncyCastle.Cryptography.dll" />
+  </ItemGroup>
+  <ILRepack
+      Parallel="true"
+      DebugInfo="true"
+      Internalize="true"
+      InputAssemblies="@(InputAssemblies)"
+      OutputFile="$(OutputPath)$(AssemblyName).Merged.dll"
+      TargetKind="Dll" />
+</Target>
+
+
+
+
+
+
