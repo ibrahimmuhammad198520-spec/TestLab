@@ -1,0 +1,231 @@
+using MailKit.Net.Smtp;
+using MailKit.Security;
+using MimeKit;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace EmailService.Core;
+
+public class EmailService : IEmailService, IDisposable
+{
+    private readonly SmtpConfig _config;
+
+    public EmailService(SmtpConfig config)
+    {
+        _config = config ?? throw new ArgumentNullException(nameof(config));
+
+        if (string.IsNullOrWhiteSpace(_config.Host))
+            throw new ArgumentException("SMTP Host must be provided.", nameof(config));
+    }
+
+    // =========================================================
+    // ASYNC CORE METHODS
+    // =========================================================
+
+    public Task SendEmailAsync(
+        string to,
+        string subject,
+        string body,
+        bool isHtml = true,
+        CancellationToken cancellationToken = default)
+    {
+        return SendEmailAsync(new[] { to }, subject, body, isHtml, cancellationToken: cancellationToken);
+    }
+
+    public async Task SendEmailAsync(
+        IEnumerable<string> to,
+        string subject,
+        string body,
+        bool isHtml = true,
+        IEnumerable<string>? cc = null,
+        IEnumerable<string>? bcc = null,
+        IEnumerable<string>? attachmentPaths = null,
+        CancellationToken cancellationToken = default)
+    {
+        var message = new MimeMessage();
+        message.From.Add(new MailboxAddress(_config.FromName, _config.FromAddress));
+
+        foreach (var addr in to)
+            message.To.Add(MailboxAddress.Parse(addr));
+
+        if (cc != null)
+            foreach (var addr in cc)
+                message.Cc.Add(MailboxAddress.Parse(addr));
+
+        if (bcc != null)
+            foreach (var addr in bcc)
+                message.Bcc.Add(MailboxAddress.Parse(addr));
+
+        message.Subject = subject;
+
+        var builder = new BodyBuilder();
+        if (isHtml)
+        {
+            builder.HtmlBody = body;
+            builder.TextBody = EmailTemplateEngine.StripHtml(body); // plain-text fallback
+        }
+        else
+        {
+            builder.TextBody = body;
+        }
+
+        if (attachmentPaths != null)
+        {
+            foreach (var path in attachmentPaths)
+            {
+                if (string.IsNullOrWhiteSpace(path))
+                    continue;
+
+                try
+                {
+                    if (File.Exists(path))
+                    {
+                        builder.Attachments.Add(path);
+                    }
+                    // File not found: silently skip, email still sends without it.
+                }
+                catch (Exception)
+                {
+                    // File exists but couldn't be read (locked, permissions, etc.) - skip, don't fail the send.
+                }
+            }
+        }
+
+        message.Body = builder.ToMessageBody();
+
+        await SendAsync(message, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task SendTemplatedEmailAsync(
+        string to,
+        string subject,
+        string template,
+        IDictionary<string, string> tokens,
+        bool isHtml = true,
+        CancellationToken cancellationToken = default)
+    {
+        var renderedBody = EmailTemplateEngine.Render(template, tokens);
+        await SendEmailAsync(to, subject, renderedBody, isHtml, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task SendAsync(MimeMessage message, CancellationToken cancellationToken)
+    {
+        using var client = new SmtpClient
+        {
+            Timeout = _config.TimeoutMs
+        };
+
+        var socketOptions = _config.EnableSsl
+            ? SecureSocketOptions.StartTlsWhenAvailable
+            : SecureSocketOptions.None;
+
+        try
+        {
+            await client.ConnectAsync(_config.Host, _config.Port, socketOptions, cancellationToken)
+                .ConfigureAwait(false);
+
+            if (!string.IsNullOrEmpty(_config.Username))
+                await client.AuthenticateAsync(_config.Username, _config.Password, cancellationToken)
+                    .ConfigureAwait(false);
+
+            await client.SendAsync(message, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            if (client.IsConnected)
+                await client.DisconnectAsync(true, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    // =========================================================
+    // SYNCHRONOUS WRAPPERS (for Leapwork / non-async hosts)
+    // =========================================================
+
+    /// <summary>
+    /// Sends an email. 'to', 'cc', 'bcc' accept comma or semicolon-separated addresses.
+    /// 'attachmentPath' accepts a single path or multiple comma/semicolon-separated paths.
+    /// A missing or unreadable attachment is silently skipped - the email still sends.
+    /// </summary>
+    public void SendEmail(
+        string to,
+        string subject,
+        string body,
+        bool isHtml = true,
+        string? cc = null,
+        string? bcc = null,
+        string? attachmentPath = null)
+    {
+        var toList = ParseAddressList(to);
+        var ccList = ParseAddressList(cc);
+        var bccList = ParseAddressList(bcc);
+        var attachmentList = ParseAddressList(attachmentPath);
+
+        SendEmailAsync(
+            toList,
+            subject,
+            body,
+            isHtml,
+            cc: ccList.Count > 0 ? ccList : null,
+            bcc: bccList.Count > 0 ? bccList : null,
+            attachmentPaths: attachmentList.Count > 0 ? attachmentList : null
+        ).ConfigureAwait(false).GetAwaiter().GetResult();
+    }
+
+    /// <summary>
+    /// Renders {{tokens}} in the template, then sends via SendEmail.
+    /// </summary>
+    public void SendTemplatedEmail(
+        string to,
+        string subject,
+        string template,
+        IDictionary<string, string> tokens,
+        bool isHtml = true,
+        string? cc = null,
+        string? bcc = null,
+        string? attachmentPath = null)
+    {
+        var renderedBody = EmailTemplateEngine.Render(template, tokens);
+        SendEmail(to, subject, renderedBody, isHtml, cc, bcc, attachmentPath);
+    }
+
+    // =========================================================
+    // HELPERS
+    // =========================================================
+
+    /// <summary>
+    /// Splits a comma or semicolon-separated string into a clean list of trimmed, non-empty values.
+    /// Returns an empty list if input is null/whitespace.
+    /// </summary>
+    private static List<string> ParseAddressList(string? input)
+    {
+        if (string.IsNullOrWhiteSpace(input))
+            return new List<string>();
+
+        return input
+            .Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(s => s.Trim())
+            .Where(s => s.Length > 0)
+            .ToList();
+    }
+
+    /// <summary>
+    /// Convenience helper to build a token dictionary in Leapwork without needing
+    /// Dictionary&lt;&gt; syntax directly: BuildTokenDictionary("Name", "Ali", "Status", "PASSED")
+    /// </summary>
+    public static IDictionary<string, string> BuildTokenDictionary(params string[] keyValuePairs)
+    {
+        var dict = new Dictionary<string, string>();
+        for (int i = 0; i < keyValuePairs.Length - 1; i += 2)
+            dict[keyValuePairs[i]] = keyValuePairs[i + 1];
+        return dict;
+    }
+
+    public void Dispose()
+    {
+        GC.SuppressFinalize(this);
+    }
+}
