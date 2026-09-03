@@ -1,841 +1,222 @@
-Model.cs
 using System;
-using System.Collections.Generic;
-
-namespace Leapwork.ReportClient
-{
-    /// <summary>
-    /// Lifecycle status of a Run (the whole schedule execution), per spec section 5.
-    /// </summary>
-    public enum RunStatus
-    {
-        Queued,
-        Executing,
-        Finished,
-        /// <summary>Any value returned by the API that is not one of the known lifecycle states.</summary>
-        Unknown
-    }
-
-    /// <summary>
-    /// Outcome status of an individual RunItem, per spec section 10.
-    /// Unknown values are preserved via RawStatus rather than silently coerced.
-    /// </summary>
-    public enum RunItemStatus
-    {
-        Passed,
-        Failed,
-        Done,
-        Cancelled,
-        Error,
-        IsProcessing,
-        NoStatus,
-        Unknown
-    }
-
-    /// <summary>Connection and behavior configuration for the client.</summary>
-    public sealed class LeapworkClientOptions
-    {
-        /// <summary>Controller API base address, e.g. https://controller.example.com/api/v4/</summary>
-        public string ControllerUrl { get; set; } = string.Empty;
-
-        /// <summary>Leapwork API access key. Never logged or included in exception messages.</summary>
-        public string AccessKey { get; set; } = string.Empty;
-
-        /// <summary>Default lookback window in days when the caller does not override it.</summary>
-        public int DefaultLookbackDays { get; set; } = 30;
-
-        /// <summary>Optional per-request timeout override.</summary>
-        public TimeSpan? RequestTimeout { get; set; }
-
-        /// <summary>
-        /// When true, the RunListId workflow also resolves flows configured in the Run List's
-        /// steps that did not generate a RunItem in the selected run, via
-        /// GET /steps/{runListStepId}/flowInfos. Default false: retains prior behavior
-        /// (report only actual RunItems, no extra API calls).
-        /// </summary>
-        public bool IncludeNotExecutedFlows { get; set; } = false;
-    }
-
-    /// <summary>Run-level summary as required by spec section 8.</summary>
-    public sealed class RunSummary
-    {
-        public Guid ScheduleId { get; set; }
-        public Guid RunId { get; set; }
-        public DateTimeOffset CreatedAt { get; set; }
-        public RunStatus Status { get; set; }
-        public string RawStatus { get; set; } = string.Empty;
-        public int Passed { get; set; }
-        public int Failed { get; set; }
-        public int Done { get; set; }
-        public int Total { get; set; }
-    }
-
-    /// <summary>RunItem-level result as required by spec section 9.</summary>
-    public sealed class RunItemResult
-    {
-        public Guid RunItemId { get; set; }
-        public Guid? FlowId { get; set; }
-        public string? FlowTitle { get; set; }
-        public Guid? AgentId { get; set; }
-        public string? AgentTitle { get; set; }
-        public RunItemStatus Status { get; set; }
-        public string RawStatus { get; set; } = string.Empty;
-        /// <summary>Supporting value only; root-level Status is authoritative per spec section 9.</summary>
-        public string? FlowInfoStatus { get; set; }
-        public int RetryAttempt { get; set; }
-        public string? FailReason { get; set; }
-        public DateTimeOffset? StartTime { get; set; }
-        public DateTimeOffset? EndTime { get; set; }
-        public TimeSpan? Duration { get; set; }
-
-        /// <summary>
-        /// Populated when this RunItem could not be retrieved or parsed. The RunItemId is still
-        /// preserved and reported per spec section 13 ("RunItem retrieval failure").
-        /// </summary>
-        public string? RetrievalError { get; set; }
-
-        public bool HasRetrievalError => !string.IsNullOrEmpty(RetrievalError);
-    }
-
-    /// <summary>
-    /// Outcome of a report request. Either Report is populated, or NoCompletedRunFound explains
-    /// why no report could be produced (spec section 13 - "No Finished run found").
-    /// </summary>
-    public sealed class ScheduleRunReportResult
-    {
-        public bool Success { get; set; }
-        public ScheduleRunReport? Report { get; set; }
-        public string? NoCompletedRunReason { get; set; }
-
-        public static ScheduleRunReportResult Ok(ScheduleRunReport report) =>
-            new ScheduleRunReportResult { Success = true, Report = report };
-
-        public static ScheduleRunReportResult NoRun(string reason) =>
-            new ScheduleRunReportResult { Success = false, NoCompletedRunReason = reason };
-    }
-
-    /// <summary>RunItem-based totals calculated from the actually retrieved RunItems, for
-    /// reconciliation against the official Passed/Failed/Done/Total from the run summary.</summary>
-    public sealed class RunItemTotals
-    {
-        public int Passed { get; set; }
-        public int Failed { get; set; }
-        public int Done { get; set; }
-        public int Total { get; set; }
-    }
-
-    /// <summary>
-    /// Comparison between the official run-level totals (from GET /run/{runId}) and totals
-    /// calculated from the retrieved RunItems. The official totals are always retained as-is;
-    /// this is informational only and never overwrites them.
-    /// </summary>
-    public sealed class ReconciliationResult
-    {
-        public RunItemTotals CalculatedTotals { get; set; } = new RunItemTotals();
-        public bool Matches { get; set; }
-        /// <summary>Null when Matches is true; otherwise explains which figures disagree and why they might.</summary>
-        public string? Warning { get; set; }
-    }
-
-    /// <summary>The consolidated response described in spec section 12.</summary>
-    public sealed class ScheduleRunReport
-    {
-        public RunSummary Summary { get; set; } = null!;
-        public List<RunItemResult> RunItems { get; set; } = new List<RunItemResult>();
-        public ReconciliationResult Reconciliation { get; set; } = new ReconciliationResult();
-    }
-
-    /// <summary>One flattened schedule entry from GET /schedules/hierarchy.</summary>
-    public sealed class ScheduleHierarchyEntry
-    {
-        public Guid ScheduleId { get; set; }
-        public string? ScheduleTitle { get; set; }
-        public bool? Enabled { get; set; }
-        /// <summary>The RunListId this schedule is associated with, when present.</summary>
-        public Guid? RunListInfoId { get; set; }
-        public string? RunListTitle { get; set; }
-        /// <summary>
-        /// RunListStepIds configured on this schedule. Only populated/used when
-        /// IncludeNotExecutedFlows is enabled — otherwise no extra API calls are made for it.
-        /// </summary>
-        public List<Guid> RunListStepIds { get; set; } = new List<Guid>();
-    }
-
-    /// <summary>A flow configured on a Run List step, from GET /steps/{runListStepId}/flowInfos.</summary>
-    public sealed class ConfiguredFlowInfo
-    {
-        public Guid RunListStepId { get; set; }
-        public Guid FlowId { get; set; }
-        public string? FlowTitle { get; set; }
-    }
-
-    /// <summary>
-    /// A flow that was configured on a Run List step but did not generate a RunItem in the
-    /// selected run. Never counted toward Passed/Failed/Done totals.
-    /// </summary>
-    public sealed class NotExecutedFlow
-    {
-        public Guid RunListStepId { get; set; }
-        public Guid FlowId { get; set; }
-        public string? FlowTitle { get; set; }
-        public string ExecutionState { get; set; } = "Not Executed \u2013 no RunItem generated";
-    }
-
-    /// <summary>Result of resolving and reporting a single RunListId (spec: RunListId-based workflow).</summary>
-    public sealed class RunListRunReport
-    {
-        public Guid RunListId { get; set; }
-        public string? RunListTitle { get; set; }
-        public Guid SelectedScheduleId { get; set; }
-        public string? SelectedScheduleTitle { get; set; }
-        public RunSummary Summary { get; set; } = null!;
-        public List<RunItemResult> RunItems { get; set; } = new List<RunItemResult>();
-        public ReconciliationResult Reconciliation { get; set; } = new ReconciliationResult();
-        /// <summary>
-        /// Configured flows with no matching RunItem in the selected run. Always empty unless
-        /// IncludeNotExecutedFlows was enabled on the client options for this request.
-        /// </summary>
-        public List<NotExecutedFlow> NotExecutedFlows { get; set; } = new List<NotExecutedFlow>();
-    }
-
-    /// <summary>
-    /// Outcome of a RunListId-based report request. Success is false with StatusMessage set to
-    /// either "No associated schedule found" or "No completed run found" when applicable.
-    /// </summary>
-    public sealed class RunListReportResult
-    {
-        public Guid RunListId { get; set; }
-        public bool Success { get; set; }
-        public RunListRunReport? Report { get; set; }
-        public string? StatusMessage { get; set; }
-
-        public static RunListReportResult Ok(RunListRunReport report) =>
-            new RunListReportResult { RunListId = report.RunListId, Success = true, Report = report };
-
-        public static RunListReportResult NoAssociatedSchedule(Guid runListId) =>
-            new RunListReportResult { RunListId = runListId, Success = false, StatusMessage = "No associated schedule found" };
-
-        public static RunListReportResult NoCompletedRun(Guid runListId) =>
-            new RunListReportResult { RunListId = runListId, Success = false, StatusMessage = "No completed run found" };
-
-        /// <summary>
-        /// A RunListId whose processing hit an API or unexpected error, isolated from the rest of
-        /// a batch request. The message never contains the AccessKey.
-        /// </summary>
-        public static RunListReportResult Error(Guid runListId, string message) =>
-            new RunListReportResult { RunListId = runListId, Success = false, StatusMessage = $"Error: {message}" };
-    }
-}
-
-====================================
-
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Net;
 using System.Net.Http;
-using System.Text.Json;
-using System.Threading;
-using System.Threading.Tasks;
+using System.Text;
+using Leapwork.ReportClient;
 
-namespace Leapwork.ReportClient
+/// <summary>
+/// LEAPWORK C# block smoke test for Leapwork.ReportClient.
+/// String-in / string-out, no async at the block boundary (uses GetAwaiter().GetResult()
+/// internally), single class only — matches the LEAPWORK C# block execution model.
+///
+/// This is compiled as a console entry point, so it needs a static Main. Inputs are read
+/// positionally from args[]; if LEAPWORK doesn't pass command-line args to the block, adjust
+/// ReadInput() below to pull from whatever mechanism it actually uses (environment variables,
+/// stdin, or a LEAPWORK-supplied Args/Parameters object) — tell me which one your block
+/// template uses and I'll match it exactly instead of guessing.
+///
+/// Expected order: controllerUrl accessKey scheduleId runListId lookbackDays runItemIds
+/// Pass an empty string ("") for scheduleId or runListId to skip that workflow.
+/// runItemIds is a comma-separated list of RunItemId GUIDs (e.g. "id1,id2,id3"); pass ""
+/// to skip. Each is fetched directly via GetRunItemAsync, bypassing run selection entirely —
+/// useful for checking specific RunItems without going through a ScheduleId/RunListId.
+/// </summary>
+public class LeapworkReportSmokeTest
 {
-    /// <summary>
-    /// Thin, read-only wrapper over the four Leapwork Controller v4 endpoints used by this
-    /// workflow. Issues GET requests only; never calls runNow or any state-changing endpoint.
-    /// </summary>
-    public sealed class LeapworkApiClient
+    public static void Main(string[] args)
     {
-        private readonly HttpClient _http;
-        private readonly LeapworkClientOptions _options;
-        private static readonly JsonSerializerOptions JsonOpts = new JsonSerializerOptions
-        {
-            PropertyNameCaseInsensitive = true
-        };
+        var controllerUrl = ReadInput(args, 0, "CONTROLLER_URL");
+        var accessKey = ReadInput(args, 1, "ACCESS_KEY");
+        var scheduleIdRaw = ReadInput(args, 2, "SCHEDULE_ID");
+        var runListIdRaw = ReadInput(args, 3, "RUN_LIST_ID");
+        var lookbackDaysRaw = ReadInput(args, 4, "LOOKBACK_DAYS");
+        var runItemIdsRaw = ReadInput(args, 5, "RUN_ITEM_IDS");
 
-        /// <param name="httpClient">
-        /// Caller-owned HttpClient. BaseAddress and the AccessKey header are configured here;
-        /// the caller remains responsible for the HttpClient's lifetime (DI container, etc.).
-        /// </param>
-        public LeapworkApiClient(HttpClient httpClient, LeapworkClientOptions options)
-        {
-            _http = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
-            _options = options ?? throw new ArgumentNullException(nameof(options));
-
-            if (string.IsNullOrWhiteSpace(options.ControllerUrl))
-                throw new LeapworkValidationException("ControllerUrl is required.");
-            if (string.IsNullOrWhiteSpace(options.AccessKey))
-                throw new LeapworkValidationException("AccessKey is required.");
-
-            var baseUrl = options.ControllerUrl.EndsWith("/") ? options.ControllerUrl : options.ControllerUrl + "/";
-            _http.BaseAddress = new Uri(baseUrl);
-
-            if (_http.DefaultRequestHeaders.Contains("AccessKey"))
-                _http.DefaultRequestHeaders.Remove("AccessKey");
-            _http.DefaultRequestHeaders.Add("AccessKey", options.AccessKey);
-
-            if (!_http.DefaultRequestHeaders.Accept.Contains(new System.Net.Http.Headers.MediaTypeWithQualityHeaderValue("application/json")))
-                _http.DefaultRequestHeaders.Accept.Add(new System.Net.Http.Headers.MediaTypeWithQualityHeaderValue("application/json"));
-
-            if (options.RequestTimeout.HasValue)
-                _http.Timeout = options.RequestTimeout.Value;
-        }
-
-        /// <summary>GET /schedules/{scheduleId}/runIds/LastDays?filterBy=LastDays&amp;count={lookbackDays}</summary>
-        public async Task<List<Guid>> GetRunIdsLastDaysAsync(Guid scheduleId, int lookbackDays, CancellationToken ct = default)
-        {
-            var path = $"schedules/{scheduleId}/runIds/LastDays?filterBy=LastDays&count={lookbackDays}";
-            var wrapper = await GetJsonAsync<RunIdsResponseDto>(path, ct, () => new RunIdsResponseDto()).ConfigureAwait(false);
-            return wrapper.RunIds ?? new List<Guid>();
-        }
-
-        /// <summary>GET /run/{runId}</summary>
-        public async Task<RunSummary> GetRunAsync(Guid runId, Guid scheduleId, CancellationToken ct = default)
-        {
-            var path = $"run/{runId}";
-            var dto = await GetJsonAsync<RunDto>(path, ct).ConfigureAwait(false);
-            return MapRunSummary(dto, scheduleId);
-        }
-
-        /// <summary>GET /run/{runId}/runItemIds</summary>
-        public async Task<List<Guid>> GetRunItemIdsAsync(Guid runId, CancellationToken ct = default)
-        {
-            var path = $"run/{runId}/runItemIds";
-            var wrapper = await GetJsonAsync<RunItemIdsResponseDto>(path, ct, () => new RunItemIdsResponseDto()).ConfigureAwait(false);
-            return wrapper.RunItemIds ?? new List<Guid>();
-        }
-
-        /// <summary>GET /runItems/{runItemId}</summary>
-        public async Task<RunItemResult> GetRunItemAsync(Guid runItemId, CancellationToken ct = default)
-        {
-            var path = $"runItems/{runItemId}";
-            var dto = await GetJsonAsync<RunItemDto>(path, ct).ConfigureAwait(false);
-            return MapRunItemResult(dto, runItemId);
-        }
-
-        // ---- internals ----
-
-        private async Task<T> GetJsonAsync<T>(string relativePath, CancellationToken ct, Func<T>? emptyFallback = null)
-        {
-            HttpResponseMessage response;
-            try
-            {
-                response = await _http.GetAsync(relativePath, ct).ConfigureAwait(false);
-            }
-            catch (TaskCanceledException ex) when (!ct.IsCancellationRequested)
-            {
-                throw new LeapworkApiException($"Request to '{relativePath}' timed out.", null, relativePath, ex);
-            }
-            catch (HttpRequestException ex)
-            {
-                throw new LeapworkApiException($"Network error calling '{relativePath}': {ex.Message}", null, relativePath, ex);
-            }
-
-            if (response.StatusCode == HttpStatusCode.Unauthorized)
-                throw LeapworkApiException.Unauthorized(relativePath);
-
-            if (response.StatusCode == HttpStatusCode.NotFound)
-                throw LeapworkApiException.NotFound(relativePath);
-
-            if (!response.IsSuccessStatusCode)
-            {
-                throw new LeapworkApiException(
-                    $"Request to '{relativePath}' failed with status {(int)response.StatusCode} {response.StatusCode}.",
-                    response.StatusCode, relativePath);
-            }
-
-            var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-
-            if (string.IsNullOrWhiteSpace(body))
-            {
-                if (emptyFallback != null) return emptyFallback();
-                throw new LeapworkApiException($"Request to '{relativePath}' returned an empty body.", response.StatusCode, relativePath);
-            }
-
-            try
-            {
-                var result = JsonSerializer.Deserialize<T>(body, JsonOpts);
-                if (result is null)
-                {
-                    if (emptyFallback != null) return emptyFallback();
-                    throw new LeapworkApiException($"Request to '{relativePath}' returned an unparsable/null payload.", response.StatusCode, relativePath);
-                }
-                return result;
-            }
-            catch (JsonException ex)
-            {
-                throw new LeapworkApiException($"Failed to parse response from '{relativePath}': {ex.Message}", response.StatusCode, relativePath, ex);
-            }
-        }
-
-        private static RunSummary MapRunSummary(RunDto dto, Guid scheduleId)
-        {
-            return new RunSummary
-            {
-                ScheduleId = scheduleId,
-                RunId = dto.RunId ?? dto.Id ?? Guid.Empty,
-                CreatedAt = dto.CreatedAt ?? DateTimeOffset.MinValue,
-                Status = ParseRunStatus(dto.Status),
-                RawStatus = dto.Status ?? string.Empty,
-                Passed = dto.Passed ?? 0,
-                Failed = dto.Failed ?? 0,
-                Done = dto.Done ?? 0,
-                Total = dto.Total ?? 0
-            };
-        }
-
-        private static RunItemResult MapRunItemResult(RunItemDto dto, Guid requestedId)
-        {
-            TimeSpan? duration = null;
-            if (dto.StartTime.HasValue && dto.EndTime.HasValue && dto.EndTime.Value >= dto.StartTime.Value)
-                duration = dto.EndTime.Value - dto.StartTime.Value;
-            else if (dto.Duration.HasValue)
-                duration = TimeSpan.FromSeconds(dto.Duration.Value);
-
-            return new RunItemResult
-            {
-                RunItemId = dto.RunItemId ?? dto.Id ?? requestedId,
-                FlowId = dto.FlowId,
-                FlowTitle = dto.FlowTitle,
-                AgentId = dto.AgentId,
-                AgentTitle = dto.AgentTitle,
-                Status = ParseRunItemStatus(dto.Status),
-                RawStatus = dto.Status ?? string.Empty,
-                FlowInfoStatus = dto.FlowInfo?.Status,
-                RetryAttempt = dto.RetryAttempt ?? 0,
-                FailReason = dto.FailReason,
-                StartTime = dto.StartTime,
-                EndTime = dto.EndTime,
-                Duration = duration
-            };
-        }
-
-        internal static RunStatus ParseRunStatus(string? raw)
-        {
-            if (string.IsNullOrWhiteSpace(raw)) return RunStatus.Unknown;
-            return raw.Trim().ToLowerInvariant() switch
-            {
-                "queued" => RunStatus.Queued,
-                "executing" => RunStatus.Executing,
-                "finished" => RunStatus.Finished,
-                _ => RunStatus.Unknown
-            };
-        }
-
-        internal static RunItemStatus ParseRunItemStatus(string? raw)
-        {
-            if (string.IsNullOrWhiteSpace(raw)) return RunItemStatus.NoStatus;
-            return raw.Trim().ToLowerInvariant() switch
-            {
-                "passed" => RunItemStatus.Passed,
-                "failed" => RunItemStatus.Failed,
-                "done" => RunItemStatus.Done,
-                "cancelled" => RunItemStatus.Cancelled,
-                "canceled" => RunItemStatus.Cancelled,
-                "error" => RunItemStatus.Error,
-                "isprocessing" => RunItemStatus.IsProcessing,
-                "processing" => RunItemStatus.IsProcessing,
-                "nostatus" => RunItemStatus.NoStatus,
-                "" => RunItemStatus.NoStatus,
-                _ => RunItemStatus.Unknown
-            };
-        }
-
-        /// <summary>
-        /// GET /schedules/hierarchy — call once per operation, not once per RunListId.
-        /// CONFIRMED shape (verified against a real Controller response): the response is a flat
-        /// JSON array. Each element has a "ScheduleHierarchy" object (whose "Id" is the ScheduleId,
-        /// and whose "Parent" array contains an ancestor chain that includes an entry with
-        /// "Type": "RunList" — that entry's "Id" is the RunListId) and a sibling "ScheduleInfo"
-        /// object (which also carries "RunListInfoId" directly, plus "IsEnabled" and the
-        /// authoritative "Id" for the schedule). Both sources of RunListId/ScheduleId are read and
-        /// reconciled below since either can be present depending on Controller version.
-        /// </summary>
-        public async Task<List<ScheduleHierarchyEntry>> GetSchedulesHierarchyAsync(CancellationToken ct = default)
-        {
-            var entries = await GetJsonAsync<List<ScheduleHierarchyEnvelopeDto>>(
-                    "schedules/hierarchy", ct, () => new List<ScheduleHierarchyEnvelopeDto>())
-                .ConfigureAwait(false);
-
-            var flat = new List<ScheduleHierarchyEntry>();
-            foreach (var entry in entries)
-            {
-                var scheduleId = entry.ScheduleInfo?.Id ?? entry.ScheduleHierarchy?.Id;
-                if (scheduleId is null) continue;
-
-                var runListNode = FindRunListNode(entry.ScheduleHierarchy);
-                var runListInfoId = entry.ScheduleInfo?.RunListInfoId ?? runListNode?.Id;
-
-                flat.Add(new ScheduleHierarchyEntry
-                {
-                    ScheduleId = scheduleId.Value,
-                    ScheduleTitle = entry.ScheduleInfo?.Title ?? entry.ScheduleHierarchy?.Title,
-                    Enabled = entry.ScheduleInfo?.IsEnabled,
-                    RunListInfoId = runListInfoId,
-                    RunListTitle = runListNode?.Title,
-                    RunListStepIds = entry.ScheduleInfo?.RunListSteps?
-                        .Select(s => s.RunListStepId ?? s.Id)
-                        .Where(id => id.HasValue)
-                        .Select(id => id!.Value)
-                        .ToList() ?? new List<Guid>()
-                });
-            }
-
-            return flat;
-        }
-
-        /// <summary>
-        /// GET /steps/{runListStepId}/flowInfos — the flows configured on one Run List step.
-        /// ASSUMPTION (unverified): the response is a wrapped object with a "FlowInfos" array,
-        /// consistent with every other list endpoint on this Controller so far (RunIds,
-        /// RunItemIds were both wrapped rather than bare arrays). Each flow entry is assumed to
-        /// carry a FlowId (or Id) and a Title (or FlowTitle). Verify via Postman before enabling
-        /// IncludeNotExecutedFlows against real data — this is the only place to adjust if the
-        /// real shape differs.
-        /// </summary>
-        public async Task<List<ConfiguredFlowInfo>> GetConfiguredFlowInfosAsync(Guid runListStepId, CancellationToken ct = default)
-        {
-            var path = $"steps/{runListStepId}/flowInfos";
-            var wrapper = await GetJsonAsync<ConfiguredFlowInfoResponseDto>(path, ct, () => new ConfiguredFlowInfoResponseDto())
-                .ConfigureAwait(false);
-
-            var flows = wrapper.FlowInfos ?? new List<ConfiguredFlowInfoDto>();
-            return flows
-                .Where(f => (f.FlowId ?? f.Id) is not null)
-                .Select(f => new ConfiguredFlowInfo
-                {
-                    RunListStepId = runListStepId,
-                    FlowId = (f.FlowId ?? f.Id)!.Value,
-                    FlowTitle = f.FlowTitle ?? f.Title
-                })
-                .ToList();
-        }
-
-        /// <summary>Walks the Parent ancestor chain looking for the first node whose Type is "RunList".</summary>
-        private static ScheduleHierarchyNodeDto? FindRunListNode(ScheduleHierarchyNodeDto? node)
-        {
-            if (node?.Parent is null) return null;
-
-            foreach (var parent in node.Parent)
-            {
-                if (string.Equals(parent.Type, "RunList", StringComparison.OrdinalIgnoreCase))
-                    return parent;
-
-                var foundDeeper = FindRunListNode(parent);
-                if (foundDeeper is not null) return foundDeeper;
-            }
-
-            return null;
-        }
-
-        // ---- raw DTOs matching the Controller v4 JSON shape ----
-
-        private sealed class RunIdsResponseDto
-        {
-            public List<Guid>? RunIds { get; set; }
-        }
-
-        private sealed class RunItemIdsResponseDto
-        {
-            public List<Guid>? RunItemIds { get; set; }
-        }
-
-        private sealed class ScheduleHierarchyEnvelopeDto
-        {
-            public ScheduleHierarchyNodeDto? ScheduleHierarchy { get; set; }
-            public ScheduleInfoSummaryDto? ScheduleInfo { get; set; }
-        }
-
-        private sealed class ScheduleHierarchyNodeDto
-        {
-            public Guid? Id { get; set; }
-            public string? Title { get; set; }
-            public string? Type { get; set; }
-            public List<ScheduleHierarchyNodeDto>? Parent { get; set; }
-        }
-
-        private sealed class ScheduleInfoSummaryDto
-        {
-            public Guid? RunListInfoId { get; set; }
-            public bool? IsEnabled { get; set; }
-            public string? Title { get; set; }
-            public Guid? Id { get; set; }
-            public List<RunListStepRefDto>? RunListSteps { get; set; }
-        }
-
-        private sealed class RunListStepRefDto
-        {
-            public Guid? RunListStepId { get; set; }
-            public Guid? Id { get; set; }
-        }
-
-        private sealed class ConfiguredFlowInfoResponseDto
-        {
-            public List<ConfiguredFlowInfoDto>? FlowInfos { get; set; }
-        }
-
-        private sealed class ConfiguredFlowInfoDto
-        {
-            public Guid? FlowId { get; set; }
-            public Guid? Id { get; set; }
-            public string? FlowTitle { get; set; }
-            public string? Title { get; set; }
-        }
-
-        private sealed class RunDto
-        {
-            public Guid? RunId { get; set; }
-            public Guid? Id { get; set; }
-            public DateTimeOffset? CreatedAt { get; set; }
-            public string? Status { get; set; }
-            public int? Passed { get; set; }
-            public int? Failed { get; set; }
-            public int? Done { get; set; }
-            public int? Total { get; set; }
-        }
-
-        private sealed class RunItemDto
-        {
-            public Guid? RunItemId { get; set; }
-            public Guid? Id { get; set; }
-            public Guid? FlowId { get; set; }
-            public string? FlowTitle { get; set; }
-            public Guid? AgentId { get; set; }
-            public string? AgentTitle { get; set; }
-            public string? Status { get; set; }
-            public int? RetryAttempt { get; set; }
-            public string? FailReason { get; set; }
-            public DateTimeOffset? StartTime { get; set; }
-            public DateTimeOffset? EndTime { get; set; }
-            public double? Duration { get; set; }
-            public FlowInfoDto? FlowInfo { get; set; }
-        }
-
-        private sealed class FlowInfoDto
-        {
-            public string? Status { get; set; }
-        }
+        var result = RunTest(controllerUrl, accessKey, scheduleIdRaw, runListIdRaw, lookbackDaysRaw, runItemIdsRaw);
+        Console.WriteLine(result);
     }
-}
 
-================================
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
-
-namespace Leapwork.ReportClient
-{
-    /// <summary>
-    /// Implements the RunListId-based workflow:
-    /// RunListId → schedule hierarchy → matching ScheduleIds → candidate runs across all of them
-    /// → latest Finished run → RunItemIds → per-RunItem detail → consolidated report.
-    ///
-    /// This is a separate class from <see cref="LeapworkReportService"/> per the RunList-to-Schedule
-    /// resolution being a distinct responsibility; it reuses that service's candidate-collection and
-    /// RunItem-retrieval logic rather than duplicating it, and does not modify the existing
-    /// ScheduleId-based public method or its behavior.
-    /// </summary>
-    public sealed class LeapworkRunListReportService
+    /// <summary>Reads a positional arg if present, otherwise falls back to an environment variable.</summary>
+    private static string ReadInput(string[] args, int index, string envVarFallback)
     {
-        private readonly LeapworkApiClient _client;
-        private readonly LeapworkReportService _reportService;
-        private readonly LeapworkClientOptions _options;
+        if (args.Length > index && !string.IsNullOrWhiteSpace(args[index]))
+            return args[index];
 
-        public LeapworkRunListReportService(LeapworkApiClient client, LeapworkReportService reportService, LeapworkClientOptions options)
+        return Environment.GetEnvironmentVariable(envVarFallback) ?? string.Empty;
+    }
+
+    public static string RunTest(string controllerUrl, string accessKey, string scheduleIdRaw, string runListIdRaw, string lookbackDaysRaw, string runItemIdsRaw = "")
+    {
+        var output = new StringBuilder();
+
+        try
         {
-            _client = client ?? throw new ArgumentNullException(nameof(client));
-            _reportService = reportService ?? throw new ArgumentNullException(nameof(reportService));
-            _options = options ?? throw new ArgumentNullException(nameof(options));
-        }
-
-        /// <summary>
-        /// Retrieves the latest completed run for the given RunListId, across every schedule
-        /// associated with it. Never starts a new execution. All calls are HTTP GET.
-        /// </summary>
-        /// <param name="runListId">Required. The Run List whose latest execution result is wanted.</param>
-        /// <param name="lookbackDaysOverride">Optional override of DefaultLookbackDays.</param>
-        public async Task<RunListReportResult> GetLatestCompletedRunReportForRunListAsync(
-            Guid runListId,
-            int? lookbackDaysOverride = null,
-            CancellationToken ct = default)
-        {
-            if (runListId == Guid.Empty)
-                throw new LeapworkValidationException("RunListId is required.");
-
-            var lookbackDays = ResolveLookbackDays(lookbackDaysOverride);
-
-            // Hierarchy is fetched fresh for a single-RunListId call; the batch overload below
-            // fetches it once and shares it across every requested RunListId instead.
-            var hierarchy = await _client.GetSchedulesHierarchyAsync(ct).ConfigureAwait(false);
-            return await ResolveAndBuildReportAsync(runListId, hierarchy, lookbackDays, ct).ConfigureAwait(false);
-        }
-
-        /// <summary>
-        /// Retrieves the latest completed run for each of several RunListIds in one operation.
-        /// The schedule hierarchy is retrieved exactly once and reused for every RunListId.
-        /// Every requested RunListId produces exactly one result in the returned list, in the
-        /// same order supplied — including RunListIds with no associated schedule, no historical
-        /// runs, no finished run, or that hit an API error. A failure processing one RunListId is
-        /// isolated to that entry and does not stop the remaining RunListIds from being processed.
-        /// </summary>
-        /// <param name="runListIds">Required. One or more RunListIds to process.</param>
-        /// <param name="lookbackDaysOverride">Optional override of DefaultLookbackDays, applied to all.</param>
-        public async Task<IReadOnlyList<RunListReportResult>> GetLatestCompletedRunReportForRunListsAsync(
-            IEnumerable<Guid> runListIds,
-            int? lookbackDaysOverride = null,
-            CancellationToken ct = default)
-        {
-            if (runListIds is null)
-                throw new ArgumentNullException(nameof(runListIds));
-
-            var ids = runListIds.ToList();
-            if (ids.Count == 0)
-                throw new LeapworkValidationException("At least one RunListId is required.");
-            if (ids.Any(id => id == Guid.Empty))
-                throw new LeapworkValidationException("RunListIds must not contain an empty Guid.");
-
-            var lookbackDays = ResolveLookbackDays(lookbackDaysOverride);
-
-            // Schedule hierarchy retrieved once and reused for every RunListId in this batch.
-            List<ScheduleHierarchyEntry> hierarchy;
-            try
+            var options = new LeapworkClientOptions
             {
-                hierarchy = await _client.GetSchedulesHierarchyAsync(ct).ConfigureAwait(false);
-            }
-            catch (LeapworkApiException ex)
-            {
-                // The hierarchy fetch is shared infrastructure for the whole batch; if it fails,
-                // every RunListId fails the same way, but each still gets its own explicit result
-                // rather than throwing out of this method and losing the other RunListIds.
-                return ids
-                    .Select(id => RunListReportResult.Error(id, $"Failed to retrieve schedule hierarchy: {ex.Message}"))
-                    .ToList();
-            }
-
-            var results = new List<RunListReportResult>(ids.Count);
-            foreach (var runListId in ids)
-            {
-                try
-                {
-                    var result = await ResolveAndBuildReportAsync(runListId, hierarchy, lookbackDays, ct).ConfigureAwait(false);
-                    results.Add(result);
-                }
-                catch (Exception ex)
-                {
-                    // Intentionally broad: this is the isolation boundary for one RunListId's
-                    // processing. Any failure here (API, validation, or otherwise) must not
-                    // prevent the remaining RunListIds in this batch from being processed. The
-                    // exception message never contains the AccessKey (see LeapworkApiException).
-                    results.Add(RunListReportResult.Error(runListId, ex.Message));
-                }
-            }
-
-            return results;
-        }
-
-        private int ResolveLookbackDays(int? lookbackDaysOverride)
-        {
-            var lookbackDays = lookbackDaysOverride ?? _options.DefaultLookbackDays;
-            if (lookbackDays <= 0)
-                throw new LeapworkValidationException("LookbackDays must be a positive number of days.");
-            return lookbackDays;
-        }
-
-        /// <summary>
-        /// Resolves one RunListId against an already-fetched hierarchy and builds its report.
-        /// Shared by both the single-RunListId and batch overloads so their behavior stays identical.
-        /// </summary>
-        private async Task<RunListReportResult> ResolveAndBuildReportAsync(
-            Guid runListId, List<ScheduleHierarchyEntry> hierarchy, int lookbackDays, CancellationToken ct)
-        {
-            // 1-3. Resolve schedules associated with this RunListId via the hierarchy.
-            var matches = hierarchy.Where(h => h.RunListInfoId == runListId).ToList();
-
-            if (matches.Count == 0)
-                return RunListReportResult.NoAssociatedSchedule(runListId);
-
-            var scheduleIds = matches.Select(m => m.ScheduleId).Distinct().ToList();
-
-            // 4-6. Candidate RunIds and details across every associated schedule.
-            var candidates = await _reportService.CollectFinishedCandidatesAsync(scheduleIds, lookbackDays, ct).ConfigureAwait(false);
-
-            // 7. Select the latest Finished run across all associated schedules.
-            var latest = LeapworkReportService.SelectLatestFinished(candidates);
-
-            if (latest is null)
-                return RunListReportResult.NoCompletedRun(runListId);
-
-            // 8. Reuse existing RunItem retrieval and report generation.
-            var runItems = await _reportService.RetrieveRunItemResultsAsync(latest.RunId, ct).ConfigureAwait(false);
-
-            var selectedScheduleMatch = matches.First(m => m.ScheduleId == latest.ScheduleId);
-            var runListTitle = matches.Select(m => m.RunListTitle).FirstOrDefault(t => !string.IsNullOrEmpty(t));
-
-            var notExecutedFlows = _options.IncludeNotExecutedFlows
-                ? await ResolveNotExecutedFlowsAsync(selectedScheduleMatch, runItems, ct).ConfigureAwait(false)
-                : new List<NotExecutedFlow>();
-
-            var report = new RunListRunReport
-            {
-                RunListId = runListId,
-                RunListTitle = runListTitle,
-                SelectedScheduleId = latest.ScheduleId,
-                SelectedScheduleTitle = selectedScheduleMatch.ScheduleTitle,
-                Summary = latest,
-                RunItems = runItems,
-                Reconciliation = LeapworkReportService.CalculateReconciliation(latest, runItems),
-                NotExecutedFlows = notExecutedFlows
+                ControllerUrl = controllerUrl,
+                AccessKey = accessKey,
+                DefaultLookbackDays = int.TryParse(lookbackDaysRaw, out var lb) && lb > 0 ? lb : 30
             };
 
-            return RunListReportResult.Ok(report);
-        }
+            using var httpClient = new HttpClient();
+            var apiClient = new LeapworkApiClient(httpClient, options);
+            var reportService = new LeapworkReportService(apiClient, options);
+            var runListService = new LeapworkRunListReportService(apiClient, reportService, options);
 
-        /// <summary>
-        /// Resolves flows configured on the selected schedule's Run List steps that have no
-        /// matching RunItem in the selected run (spec section 13). Matching is by FlowId presence
-        /// among the retrieved RunItems; each configured flow is still reported per RunListStepId
-        /// so the same FlowId appearing in multiple steps is preserved as separate entries. Never
-        /// counted toward Passed/Failed/Done — this list is purely additive/informational.
-        /// A step whose flowInfos call fails is skipped rather than failing the whole report,
-        /// since this feature is optional and supplementary to the core run report.
-        /// </summary>
-        private async Task<List<NotExecutedFlow>> ResolveNotExecutedFlowsAsync(
-            ScheduleHierarchyEntry selectedSchedule, List<RunItemResult> runItems, CancellationToken ct)
-        {
-            var executedFlowIds = new HashSet<Guid>(
-                runItems.Where(i => i.FlowId.HasValue).Select(i => i.FlowId!.Value));
-
-            var notExecuted = new List<NotExecutedFlow>();
-
-            foreach (var runListStepId in selectedSchedule.RunListStepIds)
+            // ---- Test 1: existing ScheduleId workflow ----
+            if (Guid.TryParse(scheduleIdRaw, out var scheduleId) && scheduleId != Guid.Empty)
             {
-                List<ConfiguredFlowInfo> configuredFlows;
-                try
-                {
-                    configuredFlows = await _client.GetConfiguredFlowInfosAsync(runListStepId, ct).ConfigureAwait(false);
-                }
-                catch (LeapworkApiException)
-                {
-                    continue;
-                }
+                output.AppendLine("=== ScheduleId workflow ===");
+                var scheduleResult = reportService.GetLatestCompletedRunReportAsync(scheduleId).GetAwaiter().GetResult();
+                AppendScheduleResult(output, scheduleResult);
+            }
+            else
+            {
+                output.AppendLine("=== ScheduleId workflow SKIPPED (no valid ScheduleId supplied) ===");
+            }
 
-                foreach (var flow in configuredFlows)
+            // ---- Test 2: RunListId workflow ----
+            if (Guid.TryParse(runListIdRaw, out var runListId) && runListId != Guid.Empty)
+            {
+                output.AppendLine();
+                output.AppendLine("=== RunListId workflow ===");
+                var runListResult = runListService.GetLatestCompletedRunReportForRunListAsync(runListId).GetAwaiter().GetResult();
+                AppendRunListResult(output, runListResult);
+            }
+            else
+            {
+                output.AppendLine();
+                output.AppendLine("=== RunListId workflow SKIPPED (no valid RunListId supplied) ===");
+            }
+
+            // ---- Test 3: direct RunItemId lookup (bypasses run selection entirely) ----
+            output.AppendLine();
+            if (!string.IsNullOrWhiteSpace(runItemIdsRaw))
+            {
+                output.AppendLine("=== Direct RunItemId lookup ===");
+                var runItemIds = runItemIdsRaw
+                    .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+                output.AppendLine($"Requested {runItemIds.Length} RunItemId(s).");
+
+                foreach (var raw in runItemIds)
                 {
-                    if (!executedFlowIds.Contains(flow.FlowId))
+                    if (!Guid.TryParse(raw, out var runItemId))
                     {
-                        notExecuted.Add(new NotExecutedFlow
-                        {
-                            RunListStepId = runListStepId,
-                            FlowId = flow.FlowId,
-                            FlowTitle = flow.FlowTitle
-                        });
+                        output.AppendLine($"  SKIPPED (not a valid Guid): '{raw}'");
+                        continue;
+                    }
+
+                    try
+                    {
+                        var item = apiClient.GetRunItemAsync(runItemId).GetAwaiter().GetResult();
+                        AppendRunItemLine(output, item);
+                    }
+                    catch (LeapworkApiException ex)
+                    {
+                        output.AppendLine($"  --- RunItem {runItemId} ---");
+                        output.AppendLine($"    RETRIEVAL ERROR: {ex.Message}");
                     }
                 }
             }
-
-            return notExecuted;
+            else
+            {
+                output.AppendLine("=== Direct RunItemId lookup SKIPPED (no RunItemIds supplied) ===");
+            }
         }
+        catch (LeapworkValidationException ex)
+        {
+            output.AppendLine("VALIDATION ERROR: " + ex.Message);
+        }
+        catch (LeapworkApiException ex)
+        {
+            // Never contains the AccessKey — safe to log/output as-is.
+            output.AppendLine("API ERROR: " + ex.Message);
+        }
+        catch (Exception ex)
+        {
+            output.AppendLine("UNEXPECTED ERROR: " + ex.Message);
+        }
+
+        return output.ToString();
+    }
+
+    private static void AppendScheduleResult(StringBuilder output, ScheduleRunReportResult result)
+    {
+        if (!result.Success)
+        {
+            output.AppendLine("No report: " + result.NoCompletedRunReason);
+            return;
+        }
+
+        var report = result.Report!;
+        output.AppendLine($"RunId: {report.Summary.RunId} | CreatedAt: {report.Summary.CreatedAt:u} | Status: {report.Summary.Status}");
+        output.AppendLine($"Official totals -> Passed: {report.Summary.Passed}  Failed: {report.Summary.Failed}  Done: {report.Summary.Done}  Total: {report.Summary.Total}");
+
+        if (!report.Reconciliation.Matches)
+        {
+            output.AppendLine("RECONCILIATION WARNING: " + report.Reconciliation.Warning);
+        }
+        else
+        {
+            output.AppendLine("Reconciliation: official and calculated totals match.");
+        }
+
+        output.AppendLine($"RunItems ({report.RunItems.Count}):");
+        foreach (var item in report.RunItems)
+        {
+            AppendRunItemLine(output, item);
+        }
+    }
+
+    private static void AppendRunListResult(StringBuilder output, RunListReportResult result)
+    {
+        if (!result.Success)
+        {
+            output.AppendLine("No report: " + result.StatusMessage);
+            return;
+        }
+
+        var report = result.Report!;
+        output.AppendLine($"RunListId: {report.RunListId} ({report.RunListTitle ?? "(no title)"})");
+        output.AppendLine($"Selected ScheduleId: {report.SelectedScheduleId} ({report.SelectedScheduleTitle ?? "(no title)"})");
+        output.AppendLine($"RunId: {report.Summary.RunId} | CreatedAt: {report.Summary.CreatedAt:u} | Status: {report.Summary.Status}");
+        output.AppendLine($"Official totals -> Passed: {report.Summary.Passed}  Failed: {report.Summary.Failed}  Done: {report.Summary.Done}  Total: {report.Summary.Total}");
+
+        if (!report.Reconciliation.Matches)
+        {
+            output.AppendLine("RECONCILIATION WARNING: " + report.Reconciliation.Warning);
+        }
+        else
+        {
+            output.AppendLine("Reconciliation: official and calculated totals match.");
+        }
+
+        output.AppendLine($"RunItems ({report.RunItems.Count}):");
+        foreach (var item in report.RunItems)
+        {
+            AppendRunItemLine(output, item);
+        }
+    }
+
+    private static void AppendRunItemLine(StringBuilder output, RunItemResult item)
+    {
+        output.AppendLine($"  --- RunItem {item.RunItemId} ---");
+        output.AppendLine($"    RunItemId:      {item.RunItemId}");
+
+        if (item.HasRetrievalError)
+        {
+            output.AppendLine($"    RETRIEVAL ERROR: {item.RetrievalError}");
+            return;
+        }
+
+        output.AppendLine($"    FlowId:         {item.FlowId}");
+        output.AppendLine($"    FlowTitle:      {item.FlowTitle}");
+        output.AppendLine($"    AgentId:        {item.AgentId}");
+        output.AppendLine($"    AgentTitle:     {item.AgentTitle}");
+        output.AppendLine($"    Status:         {item.Status} (raw: {item.RawStatus})");
+        output.AppendLine($"    RetryAttempt:   {item.RetryAttempt}");
+        output.AppendLine($"    FailReason:     {item.FailReason ?? "none"}");
+        output.AppendLine($"    StartTime:      {item.StartTime:u}");
+        output.AppendLine($"    Duration:       {item.Duration}");
     }
 }
